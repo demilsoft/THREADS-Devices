@@ -654,12 +654,17 @@ static int sys_disk_io(char* deviceName, int operation, void* dataBuffer, int pl
 
     deviceHandle = device_handle(deviceName);
 
-    if (deviceHandle < 0)
+    if (deviceHandle <= 0)
     {
         return -1;
     }
 
     unit = deviceHandle - 1;
+    if (unit < 0 || unit >= THREADS_MAX_DISKS)
+    {
+        return -1;
+    }
+
     if (track < 0 || track >= diskInfo[unit].tracks || firstSector >= THREADS_DISK_SECTOR_COUNT || platter < 0 || platter >= diskInfo[unit].platters)
     {
         return -1;
@@ -723,37 +728,24 @@ static int sys_disk_io(char* deviceName, int operation, void* dataBuffer, int pl
 int sys_diskinfo(char* deviceName, int* sectorSize, int* sectorCount, int* trackCount, int* platterCount)
 {
     int deviceHandle;
-    deviceHandle = device_handle(deviceName);
     int unit;
 
     deviceHandle = device_handle(deviceName);
+    unit = deviceHandle - 1;
 
-    if (deviceHandle < 0)
+    if (unit < 0 || unit >= THREADS_MAX_DISKS)
     {
         return -1;
     }
 
-    unit = deviceHandle - 1;
-
     if (sectorSize != NULL)
-    {
         *sectorSize = THREADS_DISK_SECTOR_SIZE;
-    }
-
     if (trackCount != NULL)
-    {
         *trackCount = diskInfo[unit].tracks;
-    }
-
     if (sectorCount != NULL)
-    {
         *sectorCount = THREADS_DISK_SECTOR_COUNT;
-    }
-
     if (platterCount != NULL)
-    {
         *platterCount = diskInfo[unit].platters;
-    }
 
     return 0;
 }

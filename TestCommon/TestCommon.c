@@ -93,7 +93,7 @@ int DevicesTestDriver(char* strArgs)
             {
                 if (options & DEVICES_OPTION_MESSAGEA)
                 {
-                    if (memcmp(dataBuffer, messageA, strlen(messageA) + 1))
+                    if (memcmp(dataBuffer, messageA, strlen(messageA) + 1) == 0)
                     {
                         console_output(FALSE, "%s:\tDiskRead  (%s) -  Output match!\n", strArgs, device);
                     }
@@ -104,7 +104,7 @@ int DevicesTestDriver(char* strArgs)
                 }
                 else if (options & DEVICES_OPTION_MESSAGEB)
                 {
-                    if (memcmp(dataBuffer, messageB, strlen(messageB) + 1))
+                    if (memcmp(dataBuffer, messageB, strlen(messageB) + 1) == 0)
                     {
                         console_output(FALSE, "%s:\tDiskRead  (%s) -  Output match!\n", strArgs, device);
                     }
