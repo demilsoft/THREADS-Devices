@@ -113,6 +113,7 @@ void Exit(int status)
  *		            int *semaphore -- semaphore handle
  *                      (output value: completion status)
  *
+ *  Return Value: 0 means success, -1 means error occurs
  */
 int SemCreate(int value, int *semaphore)
 {
@@ -136,6 +137,7 @@ int SemCreate(int value, int *semaphore)
  *  Arguments:    int semaphore -- semaphore handle
  *                (output value: completion status)
  *
+ *  Return Value: 0 means success, -1 means error occurs
  */
 int SemP(int semaphore)
 {
@@ -158,6 +160,7 @@ int SemP(int semaphore)
  *  Arguments:    int semaphore -- semaphore handle
  *                (output value: completion status)
  *
+ *  Return Value: 0 means success, -1 means error occurs
  */
 int SemV(int semaphore)
 {
@@ -180,6 +183,7 @@ int SemV(int semaphore)
  *  Arguments:    int semaphore -- semaphore handle
  *                (output value: completion status)
  *
+ *  Return Value: 0 means success, -1 means error occurs
  */
 int SemFree(int semaphore)
 {
@@ -257,7 +261,6 @@ void GetPID(int *pid)
     return;
 } /* end of GetPID */
 
-/* end libuser.c */
 
 
 /*
@@ -289,7 +292,7 @@ int SleepSeconds(int seconds)
  *
  *  Description: This is the call entry point for disk input.
  *
- *  Arguments:    
+ *  Arguments:
  *        char  *deviceName  -- which disk
  *        void  *dataBuffer  -- Buffer to place the data
  *        int   platter      -- platter to read from
@@ -302,7 +305,7 @@ int SleepSeconds(int seconds)
  *  Return Value: 0 means success, -1 means error occurs
  *
  */
-int DiskRead(char *deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int* status)
+int DiskRead(char* deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int* status)
 {
     system_call_arguments_t sa;
 
@@ -361,7 +364,7 @@ int DiskWrite(char* deviceName, void* dataBuffer, int platter, int track, int fi
  *
  *  Description: This is the call entry point for getting the disk size.
  *
- *  Arguments:    
+ *  Arguments:
  *        char  *deviceName  -- which disk
  *		  int	*sectorSize  -- # bytes in a sector
  *		  int	*sectorCount -- # sectors in a track
@@ -372,7 +375,7 @@ int DiskWrite(char* deviceName, void* dataBuffer, int platter, int track, int fi
  *  Return Value: 0 means success, -1 means error occurs
  *
  */
-int DiskInfo(char* deviceName, int* sectorSize, int *sectorCount, int* trackCount, int* platterCount)
+int DiskInfo(char* deviceName, int* sectorSize, int* sectorCount, int* trackCount, int* platterCount)
 {
     system_call_arguments_t sa;
 
@@ -386,3 +389,4 @@ int DiskInfo(char* deviceName, int* sectorSize, int *sectorCount, int* trackCoun
     *platterCount = (int)sa.arguments[4];
     return (int)sa.arguments[3];
 } /* end of DiskSize */
+
