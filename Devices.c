@@ -56,7 +56,6 @@ extern int DevicesEntryPoint(char*);
 //////////////////////  Helper Prototypes ////////////////////////
 
 //////////////////////// Prototypes ////////////////////////////// 
-
 int SystemCallsEntryPoint(char* arg)
 {
     char    buf[25];
