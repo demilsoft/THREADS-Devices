@@ -1,3 +1,14 @@
+////////////////////////////////////////////////////////////////////////////
+// CYBV 489 - OS Theory 
+// Name: Dean Lewis
+//
+// Devices.c - Implements the clock and disk drivers, as well as the system call handler. 
+// he clock driver should wake up sleeping processes when their time has come, and the disk driver 
+// should process disk requests from user-level processes. You will need to implement the disk arm 
+// scheduling algorithms (FCFS, SSTF, etc.) in the disk driver. The system call handler will be 
+// implemented in SystemCalls.c, but you may need to add some code here to support it.
+////////////////////////////////////////////////////////////////////////////
+
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,9 +29,7 @@
  * Submissions will be assessed with DISK_ARM_ALG_FCFS and DISK_ARM_ALG_SSTF. */
 #define DISK_ARM_ALG   DISK_ARM_ALG_FCFS
 
-static int ClockDriver(char*);
-static int DiskDriver(char*);
-
+ ///////////////////////// Types and Structures ////////////////////////
 typedef struct devices_proc
 {
     struct devices_proc* pNext;
@@ -34,12 +43,19 @@ typedef struct
     int platters;
     char deviceName[THREADS_MAX_DEVICE_NAME];
 } DiskInformation;
+///////////////////////// Types and Structures ////////////////////////
 
+//////////////////////// Prototypes ////////////////////////////// 
 static DevicesProcess devicesProcs[MAXPROC];
 static DiskInformation diskInfo[THREADS_MAX_DISKS];
 
+static int ClockDriver(char*);
+static int DiskDriver(char*);
 static inline void checkKernelMode(const char* functionName);
 extern int DevicesEntryPoint(char*);
+//////////////////////  Helper Prototypes ////////////////////////
+
+//////////////////////// Prototypes ////////////////////////////// 
 
 int SystemCallsEntryPoint(char* arg)
 {
