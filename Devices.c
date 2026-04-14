@@ -43,6 +43,13 @@ typedef struct
     int platters;
     char deviceName[THREADS_MAX_DEVICE_NAME];
 } DiskInformation;
+////////////////////// User Types and Structures //////////////////////
+typedef struct sleep_request
+{
+    struct sleep_request* pNext;                 // TEST00 ADD link next sleeper
+    int pid;                                     // TEST00 ADD store sleeping pid
+    int wakeTime;                                // TEST00 ADD store absolute wake time
+} SleepRequest;
 ///////////////////////// Types and Structures ////////////////////////
 
 //////////////////////// Prototypes ////////////////////////////// 
@@ -52,10 +59,15 @@ static DiskInformation diskInfo[THREADS_MAX_DISKS];
 static int ClockDriver(char*);
 static int DiskDriver(char*);
 static inline void checkKernelMode(const char* functionName);
-extern int DevicesEntryPoint(char*);
+extern int DevicesEntryPoint(void* pArgs);                          // TEST00 ALTER match test signature
 //////////////////////  Helper Prototypes ////////////////////////
+static SleepRequest sleepRequests[MAXPROC];                         // TEST00 ADD sleep request table
+static SleepRequest* pSleepHead = NULL;                             // TEST00 ADD sorted sleep queue head
 
+static void insert_sleep_request(SleepRequest* _SleepRequest);      // TEST00 ADD queue sleeping process
 //////////////////////// Prototypes ////////////////////////////// 
+
+// Entry point for the devices module. 
 int SystemCallsEntryPoint(char* arg)
 {
     char    buf[25];
@@ -67,11 +79,20 @@ int SystemCallsEntryPoint(char* arg)
 
     checkKernelMode(__func__);
 
+    console_output(FALSE, "Devices: entered SystemCallsEntryPoint\n"); // TEST00 ADD debug
+
     /* Assign system call handlers */
 
     /* Initialize the process table */
     for (int i = 0; i < MAXPROC; ++i)
     {
+        devicesProcs[i].pNext = NULL;                // TEST00 ADD clear process links
+        devicesProcs[i].pPrev = NULL;                // TEST00 ADD clear process links
+        devicesProcs[i].pid = -1;                    // TEST00 ADD mark slot unused
+
+        sleepRequests[i].pNext = NULL;               // TEST00 ADD clear sleep links
+        sleepRequests[i].pid = -1;                   // TEST00 ADD mark sleep unused
+        sleepRequests[i].wakeTime = 0;               // TEST00 ADD clear wake time
     }
 
     /* Create and start the clock driver */
@@ -81,6 +102,8 @@ int SystemCallsEntryPoint(char* arg)
         console_output(TRUE, "start3(): Can't create clock driver\n");
         stop(1);
     }
+
+    console_output(FALSE, "Devices: clock driver started\n");          // TEST00 ADD debug
 
     /* Create the disk drivers */
     for (i = 0; i < THREADS_MAX_DISKS; i++)
@@ -97,6 +120,9 @@ int SystemCallsEntryPoint(char* arg)
 
     /* Create first user-level process and wait for it to finish */
     sys_spawn("DevicesEntryPoint", DevicesEntryPoint, NULL, 8 * THREADS_MIN_STACK_SIZE, 3);
+    
+    console_output(FALSE, "Devices: user process spawned\n");          // TEST00 ADD debug
+
     sys_wait(&status);
 
     return 0;
@@ -118,7 +144,17 @@ static int ClockDriver(char* arg)
             return 0;
         }
 
-        /* Compute the current time and wake up any processes whose time has come */
+        int currentTime;                                         // TEST00 ALTER use clock device time
+        SleepRequest* _WakeRequest;                              // TEST00 ADD next sleeper ready
+
+        currentTime = status;                                    // TEST00 ALTER use wait_device status
+
+        while (pSleepHead != NULL && pSleepHead->wakeTime <= currentTime)
+        {
+            _WakeRequest = pSleepHead;                           // TEST00 ADD capture ready sleeper
+            pSleepHead = pSleepHead->pNext;                      // TEST00 ADD remove queue head
+            unblock(_WakeRequest->pid);                     // TEST00 ADD wake sleeping process
+        }
     }
     return 0;
 }
@@ -135,8 +171,12 @@ static int DiskDriver(char* arg)
     /* Read the disk info */
 
     /* Operating loop */
+    int status;                                                    // TEST00 ADD disk wait status
+
     while (!signaled())
     {
+        wait_device("clock", &status);
+        //wait_device(diskInfo[unit].deviceName, &status);           // TEST00 ALTER block on disk device
     }
     return 0;
 }
@@ -173,3 +213,62 @@ static inline void checkKernelMode(const char* functionName)
         stop(1);
     }
 }
+
+int sys_sleep(int seconds)
+{
+    int pid;                                                     // TEST00 ADD current process id
+    int currentTime;                                             // TEST00 ADD current system time
+    SleepRequest* _SleepRequest;                                 // TEST00 ADD request table entry
+
+    checkKernelMode(__func__);
+
+    if (seconds < 0)
+    {
+        return ERR_INVALID;                                      // TEST00 ADD reject negative sleep
+    }
+
+    if (seconds == 0)
+    {
+        return ERR_OK;                                           // TEST00 ADD allow zero sleep
+    }
+
+    pid = getpid();                                              // TEST00 ADD lookup current pid
+    currentTime = 0;                                              // TEST00 ADD Temporary
+
+    _SleepRequest = &sleepRequests[pid % MAXPROC];               // TEST00 ADD select request slot
+    _SleepRequest->pNext = NULL;                                 // TEST00 ADD clear next pointer
+    _SleepRequest->pid = pid;                                    // TEST00 ADD record sleeping pid
+    _SleepRequest->wakeTime = currentTime + (seconds * 1000000); // TEST00 ADD compute wake deadline
+
+    insert_sleep_request(_SleepRequest);                         // TEST00 ADD insert into sleep queue
+
+    block(0);                                                 // TEST00 ADD block until wakeup
+
+    return ERR_OK;                                               // TEST00 ADD sleep completed
+}
+
+static void insert_sleep_request(SleepRequest* _SleepRequest)
+{
+    SleepRequest* _Current;                                      // TEST00 ADD walk sleep queue
+    SleepRequest* _Previous;                                     // TEST00 ADD track prior node
+
+    if (pSleepHead == NULL || _SleepRequest->wakeTime < pSleepHead->wakeTime)
+    {
+        _SleepRequest->pNext = pSleepHead;                       // TEST00 ADD insert at queue head
+        pSleepHead = _SleepRequest;                              // TEST00 ADD update sleep head
+        return;
+    }
+
+    _Previous = pSleepHead;                                      // TEST00 ADD start at queue head
+    _Current = pSleepHead->pNext;                                // TEST00 ADD advance to next node
+
+    while (_Current != NULL && _Current->wakeTime <= _SleepRequest->wakeTime)
+    {
+        _Previous = _Current;                                    // TEST00 ADD move previous forward
+        _Current = _Current->pNext;                              // TEST00 ADD move current forward
+    }
+
+    _SleepRequest->pNext = _Current;                             // TEST00 ADD link new request
+    _Previous->pNext = _SleepRequest;                            // TEST00 ADD splice into queue
+}
+
