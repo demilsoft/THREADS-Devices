@@ -59,6 +59,22 @@ typedef struct sleep_request
     int pid;                                                                        // TEST00 ADD store sleeping pid
     int wakeTime;                                                                   // TEST00 ADD store absolute wake time
 } SleepRequest;
+
+typedef struct disk_request
+{
+    struct disk_request* pNext;                                                       // TEST04 ADD queue next request
+    int pid;                                                                          // TEST04 ADD requesting pid
+    char deviceName[THREADS_MAX_DEVICE_NAME];                                         // TEST04 ADD target device name
+    void* dataBuffer;                                                                 // TEST04 ADD user buffer pointer
+    int platter;                                                                      // TEST04 ADD starting platter
+    int track;                                                                        // TEST04 ADD starting track
+    int firstSector;                                                                  // TEST04 ADD starting sector
+    int sectorCount;                                                                  // TEST04 ADD number of sectors
+    int isWrite;                                                                      // TEST04 ADD request direction
+    int status;                                                                       // TEST04 ADD completion status
+    int result;                                                                       // TEST04 ADD syscall result
+    int completeMbox;                                                                 // TEST04 ADD completion mailbox
+} DiskRequest;
 ///////////////////////// Types and Structures ////////////////////////
 
 //////////////////////// Prototypes ////////////////////////////// 
@@ -78,9 +94,17 @@ static void system_call_handler(system_call_arguments_t* args);                 
 static int get_current_time(void);                                                  // TEST00 ADD read current time
 static int lastClockReport = -1000000;                                              // TEST00 ADD throttle clock debug
 static int sleepClockTime = 0;                                                      // TEST00 ADD shared sleep clock time
+static int get_disk_unit(char* deviceName);
+//static unsigned char diskStorage[THREADS_MAX_DISKS][3][512][THREADS_DISK_SECTOR_COUNT][THREADS_DISK_SECTOR_SIZE]; // TEST03 ADD temporary in-memory disk
+static DiskRequest diskRequests[MAXPROC];                                             // TEST04 ADD request table
+static DiskRequest* pDiskQueueHead[THREADS_MAX_DISKS];                                // TEST04 ADD per-disk queue head
+static int diskRequestMbox[THREADS_MAX_DISKS];                                        // TEST04 ADD per-disk wake mailbox
 static unsigned char diskStorage[THREADS_MAX_DISKS][3][512][THREADS_DISK_SECTOR_COUNT][THREADS_DISK_SECTOR_SIZE]; // TEST03 ADD temporary in-memory disk
-int sys_disk_info(int unit, int* platters, int* sectors, int* tracks, int* disk);   // TEST02 ADD disk info syscall prototype
-static int get_disk_unit(char* deviceName);                                         // TEST02 ADD map disk name to unit
+static void insert_disk_request(int unit, DiskRequest* _DiskRequest);                  // TEST04 ADD queue disk request
+static DiskRequest* pop_disk_request(int unit);                                        // TEST04 ADD pop disk request
+static int do_disk_transfer(DiskRequest* _DiskRequest);                                // TEST04 ADD execute disk request
+
+int sys_disk_info(int unit, int* platters, int* sectors, int* tracks, int* disk);   // TEST02 ADD disk info syscall prototype                            // TEST02 ADD map disk name to unit
 int sys_disk_io(char* deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int isWrite, int* status); // TEST03 ADD shared disk io helper
 int sys_diskread(char* deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int* status);
 int sys_diskwrite(char* deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int* status);
@@ -119,6 +143,12 @@ int SystemCallsEntryPoint(char* arg)
         sleepRequests[i].pNext = NULL;                                  // TEST00 ADD clear sleep links
         sleepRequests[i].pid = -1;                                      // TEST00 ADD mark sleep unused
         sleepRequests[i].wakeTime = 0;                                  // TEST00 ADD clear wake time
+
+        diskRequests[i].pNext = NULL;                                                         // TEST04 ADD clear request links
+        diskRequests[i].pid = -1;                                                             // TEST04 ADD mark request slot unused
+        diskRequests[i].completeMbox = mailbox_create(1, 0);                                  // TEST04 ADD create request mailbox
+        diskRequests[i].status = -1;                                                          // TEST04 ADD clear request status
+        diskRequests[i].result = -1;                                                          // TEST04 ADD clear request result
     }
 
     //clockReadyMbox = mailbox_create(1, 0);                            // TEST02 ALTER create buffered clock ready mailbox
@@ -152,6 +182,9 @@ int SystemCallsEntryPoint(char* arg)
             console_output(TRUE, "start3(): Can't create disk driver %d\n", i);
             stop(1);
         }
+        pDiskQueueHead[i] = NULL;                                                         // TEST04 ADD clear disk queue head
+        diskRequestMbox[i] = mailbox_create(MAXPROC, 0);                                  // TEST04 ADD create disk wake mailbox
+
     }
 
     /* Create first user-level process and wait for it to finish */
@@ -168,6 +201,7 @@ int SystemCallsEntryPoint(char* arg)
     for (i = 0; i < THREADS_MAX_DISKS; i++)                             // TEST02 ADD stop disk drivers
     {
         k_kill(diskPids[i], SIG_TERM);                                  // TEST02 ADD signal disk driver exit
+        mailbox_send(diskRequestMbox[i], NULL, 0, FALSE);               // TEST07 ADD wake blocked disk driver
         k_wait(&status);                                                // TEST02 ADD reap disk driver
     }
 
@@ -230,7 +264,7 @@ static int DiskDriver(char* arg)
     int unit = atoi(arg);
     int currentTrack = 0;
     device_control_block_t devRequest;
-    int status;                                                 // TEST02 ADD disk wait status
+    //int status;                                                 // TEST02 ADD disk wait status
 
     set_psr(get_psr() | PSR_INTERRUPTS);
 
@@ -258,8 +292,27 @@ static int DiskDriver(char* arg)
 
     while (!signaled())
     {
-        wait_device("clock", &status);                          // TEST02 ALTER temporary safe disk block
+        DiskRequest* _DiskRequest;                                                         // TEST04 ADD next disk request
+
+        mailbox_receive(diskRequestMbox[unit], NULL, 0, TRUE);                             // TEST04 ADD wait for request
+
+        if (signaled())
+        {
+            break;                                                                         // TEST04 ADD stop after signal
+        }
+
+        _DiskRequest = pop_disk_request(unit);                                             // TEST04 ADD dequeue next request
+        if (_DiskRequest == NULL)
+        {
+            continue;                                                                      // TEST04 ADD ignore empty wakeup
+        }
+
+        _DiskRequest->result = do_disk_transfer(_DiskRequest);                             // TEST04 ADD perform disk request
+        _DiskRequest->status = (_DiskRequest->result == 0) ? 0 : -1;                       // TEST04 ADD set device status
+
+        mailbox_send(_DiskRequest->completeMbox, NULL, 0, FALSE);                          // TEST04 ADD wake requesting process
     }
+
     return 0;
 }
 
@@ -499,110 +552,209 @@ int sys_disk_info(int unit, int* platters, int* sectors, int* tracks, int* disk)
     return 0;                                                       // TEST02 ADD disk info success
 }
 
-//int sys_diskread(system_call_arguments_t* sa)
-//{
-//    char* device = (char*)sa->arguments[0];
-//    void* buffer = (void*)sa->arguments[1];
-//    int platter = (int)sa->arguments[2];
-//    int track = (int)sa->arguments[3];
-//    int sector = (int)sa->arguments[4];
-//    int sectors = (int)sa->arguments[5];
-//
-//    // TESTXX ADD {parse disk args}
-//
-//    int status = 0;
-//    int rc = disk_read(device, buffer, platter, track, sector, sectors, &status);
-//
-//    // TESTXX ADD {invoke disk driver}
-//
-//    sa->arguments[0] = status;
-//    sa->arguments[3] = rc;
-//
-//    // TESTXX ADD {return results to user}
-//
-//    return 0;
-//}
-
-int sys_diskread(char* deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int* status)
-{
-    // TESTXX ADD {route read through helper}
-    return sys_disk_io(deviceName, dataBuffer, platter, track, firstSector, sectors, 0, status);
-}
-
-int sys_diskwrite(char* deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int* status)
-{
-    // TESTXX ADD {route write through helper}
-    return sys_disk_io(deviceName, dataBuffer, platter, track, firstSector, sectors, 1, status);
-}
-
 int sys_disk_io(char* deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int isWrite, int* status)
 {
-    int unit;                                                                              // TEST03 ADD disk unit lookup
-    int sectorIndex;                                                                       // TEST03 ADD walk requested sectors
-    unsigned char* _BufferBytes;                                                           // TEST03 ADD byte buffer view
+    int pid;                                                                           // TEST04 ADD current pid
+    int unit;                                                                          // TEST04 ADD disk unit lookup
+    DiskRequest* _DiskRequest;                                                         // TEST04 ADD request table entry
 
-    checkKernelMode(__func__);                                                             // TEST03 ADD validate kernel mode
+    checkKernelMode(__func__);                                                         // TEST04 ADD validate kernel mode
 
     if (status == NULL)
     {
-        return -1;                                                                         // TEST03 ADD reject null status
+        return -1;                                                                     // TEST04 ADD reject null status
     }
 
-    *status = -1;                                                                          // TEST03 ADD default failure status
+    *status = -1;                                                                      // TEST04 ADD default failure status
 
     if (deviceName == NULL || dataBuffer == NULL)
     {
-        return -1;                                                                         // TEST03 ADD reject null inputs
+        return -1;                                                                     // TEST04 ADD reject null inputs
     }
 
     if (platter < 0 || track < 0 || firstSector < 0 || sectors <= 0)
     {
-        return -1;                                                                         // TEST03 ADD reject negative geometry
+        return -1;                                                                     // TEST04 ADD reject invalid geometry
     }
 
     if (isWrite != 0 && isWrite != 1)
     {
-        return -1;                                                                         // TEST03 ADD reject invalid direction
+        return -1;                                                                     // TEST04 ADD reject invalid direction
     }
 
-    unit = get_disk_unit(deviceName);                                                      // TEST03 ADD map device to unit
+    unit = get_disk_unit(deviceName);                                                  // TEST04 ADD map device to unit
     if (unit < 0 || unit >= THREADS_MAX_DISKS)
     {
-        return -1;                                                                         // TEST03 ADD reject invalid unit
+        return -1;                                                                     // TEST04 ADD reject invalid disk unit
     }
 
-    if (platter >= diskInfo[unit].platters)
+    pid = k_getpid();                                                                  // TEST04 ADD get requester pid
+    _DiskRequest = &diskRequests[pid % MAXPROC];                                       // TEST04 ADD select request slot
+
+    _DiskRequest->pNext = NULL;                                                        // TEST04 ADD clear next link
+    _DiskRequest->pid = pid;                                                           // TEST04 ADD record requester pid
+    strncpy(_DiskRequest->deviceName, deviceName, THREADS_MAX_DEVICE_NAME - 1);        // TEST04 ADD copy device name
+    _DiskRequest->deviceName[THREADS_MAX_DEVICE_NAME - 1] = '\0';                      // TEST04 ADD terminate device name
+    _DiskRequest->dataBuffer = dataBuffer;                                             // TEST04 ADD store buffer pointer
+    _DiskRequest->platter = platter;                                                   // TEST04 ADD store platter
+    _DiskRequest->track = track;                                                       // TEST04 ADD store track
+    _DiskRequest->firstSector = firstSector;                                           // TEST04 ADD store first sector
+    _DiskRequest->sectorCount = sectors;                                               // TEST04 ADD store sector count
+    _DiskRequest->isWrite = isWrite;                                                   // TEST04 ADD store direction
+    _DiskRequest->status = -1;                                                         // TEST04 ADD clear request status
+    _DiskRequest->result = -1;                                                         // TEST04 ADD clear request result
+
+    insert_disk_request(unit, _DiskRequest);                                           // TEST04 ADD enqueue request
+    mailbox_send(diskRequestMbox[unit], NULL, 0, FALSE);                               // TEST04 ADD wake disk driver
+    mailbox_receive(_DiskRequest->completeMbox, NULL, 0, TRUE);                        // TEST04 ADD wait for completion
+
+    *status = _DiskRequest->status;                                                    // TEST04 ADD return device status
+    return _DiskRequest->result;                                                       // TEST04 ADD return syscall result
+}
+
+static void insert_disk_request(int unit, DiskRequest* _DiskRequest)
+{
+    DiskRequest* _Current;                                                             // TEST04 ADD walk request queue
+    DiskRequest* _Previous;                                                            // TEST04 ADD track prior node
+
+    _DiskRequest->pNext = NULL;                                                        // TEST04 ADD clear next link
+
+    if (pDiskQueueHead[unit] == NULL)
     {
-        return -1;                                                                         // TEST03 ADD reject invalid platter
+        pDiskQueueHead[unit] = _DiskRequest;                                           // TEST04 ADD insert first request
+        return;
     }
 
-    if (track >= diskInfo[unit].tracks)
+    if (DISK_ARM_ALG == DISK_ARM_ALG_FCFS)
     {
-        return -1;                                                                         // TEST03 ADD reject invalid track
-    }
-
-    if (firstSector + sectors > diskInfo[unit].sectors)
-    {
-        return -1;                                                                         // TEST03 ADD reject sector overflow
-    }
-
-    _BufferBytes = (unsigned char*)dataBuffer;                                             // TEST03 ADD treat buffer as bytes
-
-    for (sectorIndex = 0; sectorIndex < sectors; ++sectorIndex)
-    {
-        unsigned char* _DiskSector = diskStorage[unit][platter][track][firstSector + sectorIndex]; // TEST03 ADD select sector
-        unsigned char* _UserSector = _BufferBytes + (sectorIndex * THREADS_DISK_SECTOR_SIZE);       // TEST03 ADD select user sector
-
-        if (isWrite)
+        _Current = pDiskQueueHead[unit];                                               // TEST04 ADD find queue tail
+        while (_Current->pNext != NULL)
         {
-            memcpy(_DiskSector, _UserSector, THREADS_DISK_SECTOR_SIZE);                    // TEST03 ADD copy user data to disk
+            _Current = _Current->pNext;                                                // TEST04 ADD advance to tail
+        }
+        _Current->pNext = _DiskRequest;                                                // TEST04 ADD append request
+        return;
+    }
+
+    _Previous = NULL;                                                                  // TEST05 ADD begin SSTF insertion
+    _Current = pDiskQueueHead[unit];
+    while (_Current != NULL && _Current->track <= _DiskRequest->track)
+    {
+        _Previous = _Current;                                                          // TEST05 ADD move previous forward
+        _Current = _Current->pNext;                                                    // TEST05 ADD move current forward
+    }
+
+    if (_Previous == NULL)
+    {
+        _DiskRequest->pNext = pDiskQueueHead[unit];                                    // TEST05 ADD insert at queue head
+        pDiskQueueHead[unit] = _DiskRequest;                                           // TEST05 ADD update queue head
+    }
+    else
+    {
+        _DiskRequest->pNext = _Current;                                                // TEST05 ADD link new request
+        _Previous->pNext = _DiskRequest;                                               // TEST05 ADD splice new request
+    }
+}
+
+static DiskRequest* pop_disk_request(int unit)
+{
+    DiskRequest* _DiskRequest;                                                         // TEST04 ADD selected request
+
+    _DiskRequest = pDiskQueueHead[unit];                                               // TEST04 ADD grab queue head
+    if (_DiskRequest != NULL)
+    {
+        pDiskQueueHead[unit] = _DiskRequest->pNext;                                    // TEST04 ADD unlink queue head
+        _DiskRequest->pNext = NULL;                                                    // TEST04 ADD clear next link
+    }
+
+    return _DiskRequest;                                                               // TEST04 ADD return request
+}
+
+static int do_disk_transfer(DiskRequest* _DiskRequest)
+{
+    int unit;                                                                          // TEST04 ADD disk unit lookup
+    int sectorOffset;                                                                  // TEST06 ADD iterate requested sectors
+    int currentPlatter;                                                                // TEST06 ADD active platter position
+    int currentTrack;                                                                  // TEST06 ADD active track position
+    int currentSector;                                                                 // TEST06 ADD active sector position
+    unsigned char* _BufferBytes;                                                       // TEST04 ADD byte buffer view
+
+    if (_DiskRequest == NULL)
+    {
+        return -1;                                                                     // TEST04 ADD reject null request
+    }
+
+    unit = get_disk_unit(_DiskRequest->deviceName);                                    // TEST04 ADD map device to unit
+    if (unit < 0 || unit >= THREADS_MAX_DISKS)
+    {
+        return -1;                                                                     // TEST04 ADD reject invalid unit
+    }
+
+    if (_DiskRequest->platter < 0 || _DiskRequest->platter >= diskInfo[unit].platters)
+    {
+        return -1;                                                                     // TEST04 ADD reject invalid platter
+    }
+
+    if (_DiskRequest->track < 0 || _DiskRequest->track >= diskInfo[unit].tracks)
+    {
+        return -1;                                                                     // TEST04 ADD reject invalid track
+    }
+
+    if (_DiskRequest->firstSector < 0 || _DiskRequest->firstSector >= diskInfo[unit].sectors)
+    {
+        return -1;                                                                     // TEST04 ADD reject invalid sector
+    }
+
+    if (_DiskRequest->sectorCount <= 0)
+    {
+        return -1;                                                                     // TEST04 ADD reject invalid sector count
+    }
+
+    _BufferBytes = (unsigned char*)_DiskRequest->dataBuffer;                           // TEST04 ADD treat buffer as bytes
+    currentPlatter = _DiskRequest->platter;                                            // TEST06 ADD initialize platter walk
+    currentTrack = _DiskRequest->track;                                                // TEST06 ADD initialize track walk
+    currentSector = _DiskRequest->firstSector;                                         // TEST06 ADD initialize sector walk
+
+    for (sectorOffset = 0; sectorOffset < _DiskRequest->sectorCount; ++sectorOffset)
+    {
+        unsigned char* _DiskSector;                                                    // TEST06 ADD current disk sector
+        unsigned char* _UserSector;                                                    // TEST06 ADD current user sector
+
+        if (currentPlatter >= diskInfo[unit].platters)
+        {
+            return -1;                                                                 // TEST06 ADD reject platter overflow
+        }
+
+        if (currentTrack >= diskInfo[unit].tracks)
+        {
+            currentPlatter += 1;                                                       // TEST06 ADD advance platter
+            currentTrack = 0;                                                          // TEST06 ADD reset track after wrap
+
+            if (currentPlatter >= diskInfo[unit].platters)
+            {
+                return -1;                                                             // TEST06 ADD reject disk overflow
+            }
+        }
+
+        _DiskSector = diskStorage[unit][currentPlatter][currentTrack][currentSector];  // TEST04 ADD select disk sector
+        _UserSector = _BufferBytes + (sectorOffset * THREADS_DISK_SECTOR_SIZE);        // TEST04 ADD select user sector
+
+        if (_DiskRequest->isWrite)
+        {
+            memcpy(_DiskSector, _UserSector, THREADS_DISK_SECTOR_SIZE);                // TEST04 ADD copy user data to disk
         }
         else
         {
-            memcpy(_UserSector, _DiskSector, THREADS_DISK_SECTOR_SIZE);                    // TEST03 ADD copy disk data to user
+            memcpy(_UserSector, _DiskSector, THREADS_DISK_SECTOR_SIZE);                // TEST04 ADD copy disk data to user
+        }
+
+        currentSector += 1;                                                            // TEST06 ADD advance sector
+        if (currentSector >= diskInfo[unit].sectors)
+        {
+            currentSector = 0;                                                         // TEST06 ADD wrap sector index
+            currentTrack += 1;                                                         // TEST06 ADD advance track
         }
     }
 
-    *status = 0;                                                                           // TEST03 ADD report device success
-    return 0;                                                                              // TEST03 ADD report syscall success
+    return 0;                                                                          // TEST04 ADD transfer success
 }
