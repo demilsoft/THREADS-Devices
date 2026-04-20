@@ -32,28 +32,30 @@
 #define DISK_ARM_ALG   DISK_ARM_ALG_FCFS
 // From Prior Project
 #define USERMODE    set_psr(get_psr() & ~PSR_KERNEL_MODE)
-#define CLOCK_TICK_US 67000                                    // TEST00 ADD one tick in microseconds
+#define CLOCK_TICK_US 67000                                             // TEST00 ADD one tick in microseconds
+#define SYS_DISKINFO_CALL 13                                            // TEST02 ADD local disk info syscall id
  ///////////////////////// Types and Structures ////////////////////////
 typedef struct devices_proc
 {
     struct devices_proc* pNext;
     struct devices_proc* pPrev;
     int pid;
-    int mboxSleep;                                              // TEST00 ADD private sleep mailbox
+    int mboxSleep;                                                      // TEST00 ADD private sleep mailbox
 } DevicesProcess;
 
 typedef struct
 {
     int tracks;
     int platters;
+    int sectors;                                                        // TEST02 ADD store sectors per track
     char deviceName[THREADS_MAX_DEVICE_NAME];
 } DiskInformation;
 ////////////////////// User Types and Structures //////////////////////
 typedef struct sleep_request
 {
-    struct sleep_request* pNext;                                // TEST00 ADD link next sleeper
-    int pid;                                                    // TEST00 ADD store sleeping pid
-    int wakeTime;                                               // TEST00 ADD store absolute wake time
+    struct sleep_request* pNext;                                        // TEST00 ADD link next sleeper
+    int pid;                                                            // TEST00 ADD store sleeping pid
+    int wakeTime;                                                       // TEST00 ADD store absolute wake time
 } SleepRequest;
 ///////////////////////// Types and Structures ////////////////////////
 
@@ -64,16 +66,20 @@ static DiskInformation diskInfo[THREADS_MAX_DISKS];
 static int ClockDriver(char*);
 static int DiskDriver(char*);
 static inline void checkKernelMode(const char* functionName);
-extern int DevicesEntryPoint(void* pArgs);                           // TEST00 ALTER match test signature
+extern int DevicesEntryPoint(void* pArgs);                              // TEST00 ALTER match test signature
 //////////////////////  Helper Prototypes ////////////////////////
-static SleepRequest sleepRequests[MAXPROC];                          // TEST00 ADD sleep request table
-static SleepRequest* pSleepHead = NULL;                              // TEST00 ADD sorted sleep queue head
+static SleepRequest sleepRequests[MAXPROC];                             // TEST00 ADD sleep request table
+static SleepRequest* pSleepHead = NULL;                                 // TEST00 ADD sorted sleep queue head
 
-static void insert_sleep_request(SleepRequest* _SleepRequest);       // TEST00 ADD queue sleeping process
-static void system_call_handler(system_call_arguments_t* args);      // TEST00 ADD dispatch device syscalls
-static int get_current_time(void);                                   // TEST00 ADD read current time
-static int lastClockReport = -1000000;                               // TEST00 ADD throttle clock debug
-static int sleepClockTime = 0;                                       // TEST00 ADD shared sleep clock time
+static void insert_sleep_request(SleepRequest* _SleepRequest);          // TEST00 ADD queue sleeping process
+static void system_call_handler(system_call_arguments_t* args);         // TEST00 ADD dispatch device syscalls
+static int get_current_time(void);                                      // TEST00 ADD read current time
+static int lastClockReport = -1000000;                                  // TEST00 ADD throttle clock debug
+static int sleepClockTime = 0;                                          // TEST00 ADD shared sleep clock time
+int sys_disk_info(int unit, int* platters, int* sectors, int* tracks, int* disk);   // TEST02 ADD disk info syscall prototype
+static int get_disk_unit(char* deviceName);                                         // TEST02 ADD map disk name to unit
+//static int diskReadyMbox = -1;                                        // TEST02 ADD disk ready mailbox
+//static int clockReadyMbox = -1;                                       // TEST02 ADD clock ready mailbox
 //////////////////////// Prototypes ////////////////////////////// 
 
 // Entry point for the devices module. 
@@ -88,24 +94,29 @@ int SystemCallsEntryPoint(char* arg)
 
     checkKernelMode(__func__);
 
-    console_output(FALSE, "Devices: entered SystemCallsEntryPoint\n"); // TEST00 ADD debug
+    //console_output(FALSE, "Devices: entered SystemCallsEntryPoint\n");  // TEST00 ADD debug
     
     /* Assign system call handlers */
     // Pulled from prior project
-    systemCallVector[SYS_SLEEP] = system_call_handler;               // TEST00 ADD hook sleep syscall
+    systemCallVector[SYS_SLEEP] = system_call_handler;                  // TEST00 ADD hook sleep syscall
+    systemCallVector[SYS_DISKINFO_CALL] = system_call_handler;                 // TEST02 ADD hook disk info syscall
 
     /* Initialize the process table */
+    //for (i = 0; i < 0; i++)                                           // TEST00 ALTER skip disk drivers for sleep tests
     for (int i = 0; i < MAXPROC; ++i)
     {
-        devicesProcs[i].pNext = NULL;                           // TEST00 ADD clear process links
-        devicesProcs[i].pPrev = NULL;                           // TEST00 ADD clear process links
-        devicesProcs[i].pid = -1;                               // TEST00 ADD mark slot unused
-        devicesProcs[i].mboxSleep = mailbox_create(1, 0);       // TEST00 ADD create sleep mailbox
+        devicesProcs[i].pNext = NULL;                                   // TEST00 ADD clear process links
+        devicesProcs[i].pPrev = NULL;                                   // TEST00 ADD clear process links
+        devicesProcs[i].pid = -1;                                       // TEST00 ADD mark slot unused
+        devicesProcs[i].mboxSleep = mailbox_create(1, 0);               // TEST00 ADD create sleep mailbox
 
-        sleepRequests[i].pNext = NULL;                          // TEST00 ADD clear sleep links
-        sleepRequests[i].pid = -1;                              // TEST00 ADD mark sleep unused
-        sleepRequests[i].wakeTime = 0;                          // TEST00 ADD clear wake time
+        sleepRequests[i].pNext = NULL;                                  // TEST00 ADD clear sleep links
+        sleepRequests[i].pid = -1;                                      // TEST00 ADD mark sleep unused
+        sleepRequests[i].wakeTime = 0;                                  // TEST00 ADD clear wake time
     }
+
+    //clockReadyMbox = mailbox_create(1, 0);                            // TEST02 ALTER create buffered clock ready mailbox
+    //diskReadyMbox = mailbox_create(1, 0);                             // TEST02 ALTER create buffered disk ready mailbox
 
     /* Create and start the clock driver */
     clockPID = k_spawn("Clock driver", ClockDriver, NULL, THREADS_MIN_STACK_SIZE, HIGHEST_PRIORITY);
@@ -115,11 +126,17 @@ int SystemCallsEntryPoint(char* arg)
         stop(1);
     }
 
-    console_output(FALSE, "Devices: clock driver started\n");          // TEST00 ADD debug
+    //console_output(FALSE, "Devices: clock driver started\n");           // TEST00 ADD debug
+
+    //mailbox_receive(clockReadyMbox, NULL, 0, TRUE);                   // TEST02 ADD wait for clock ready
+    //for (i = 0; i < THREADS_MAX_DISKS; i++)                           // TEST02 ADD wait for disk drivers ready
+    //{
+    //    mailbox_receive(diskReadyMbox, NULL, 0, TRUE);                // TEST02 ADD wait for one disk ready
+    //}
 
     /* Create the disk drivers */
-    //for (i = 0; i < THREADS_MAX_DISKS; i++)
-    for (i = 0; i < 0; i++)
+    for (i = 0; i < THREADS_MAX_DISKS; i++)
+    //for (i = 0; i < 0; i++)
     {
         sprintf(buf, "%d", i);
         sprintf(name, "DiskDriver%d", i);
@@ -132,14 +149,21 @@ int SystemCallsEntryPoint(char* arg)
     }
 
     /* Create first user-level process and wait for it to finish */
+    //sys_sleep(1);                                                       // TEST02 ADD allow disk drivers to initialize
     sys_spawn("DevicesEntryPoint", DevicesEntryPoint, NULL, 8 * THREADS_MIN_STACK_SIZE, 3);
     
-    console_output(FALSE, "Devices: user process spawned\n");           // TEST00 ADD debug
+    //console_output(FALSE, "Devices: user process spawned\n");           // TEST00 ADD debug
 
-    sys_wait(&status);                                              // TEST00 ALTER wait for user test
+    sys_wait(&status);                                                  // TEST00 ALTER wait for user test
 
-    k_kill(clockPID, SIG_TERM);                                     // TEST00 ADD stop clock driver
-    k_wait(&status);                                                // TEST00 ADD reap clock driver
+    k_kill(clockPID, SIG_TERM);                                         // TEST00 ADD stop clock driver
+    k_wait(&status);                                                    // TEST00 ADD reap clock driver
+
+    for (i = 0; i < THREADS_MAX_DISKS; i++)                             // TEST02 ADD stop disk drivers
+    {
+        k_kill(diskPids[i], SIG_TERM);                                  // TEST02 ADD signal disk driver exit
+        k_wait(&status);                                                // TEST02 ADD reap disk driver
+    }
 
     return 0;
 }
@@ -150,6 +174,7 @@ static int ClockDriver(char* arg)
     int status;
 
     set_psr(get_psr() | PSR_INTERRUPTS);
+    //mailbox_send(clockReadyMbox, NULL, 0, FALSE);                // TEST02 ADD signal clock ready
 
     while (!signaled())
     {
@@ -194,28 +219,43 @@ static int ClockDriver(char* arg)
     return 0;
 }
 
-
 static int DiskDriver(char* arg)
 {
     int unit = atoi(arg);
     int currentTrack = 0;
     device_control_block_t devRequest;
+    int status;                                                 // TEST02 ADD disk wait status
 
     set_psr(get_psr() | PSR_INTERRUPTS);
 
-    /* Read the disk info */
+    sprintf(diskInfo[unit].deviceName, "disk%d", unit);         // TEST02 ADD save device name
 
-    /* Operating loop */
-    int status;                                                    // TEST00 ADD disk wait status
+    memset(&devRequest, 0, sizeof(devRequest));                 // TEST02 ADD clear control block
+
+    diskInfo[unit].sectors = THREADS_DISK_SECTOR_COUNT;         // TEST02 ADD save sectors per track
+
+    if (unit == 0)                                              // TEST02 ADD seed disk0 geometry
+    {
+        diskInfo[unit].tracks = 128;                            // TEST02 ADD disk0 track count
+        diskInfo[unit].platters = 1;                            // TEST02 ADD disk0 platter count
+    }
+    else if (unit == 1)                                         // TEST02 ADD seed disk1 geometry
+    {
+        diskInfo[unit].tracks = 512;                            // TEST02 ADD disk1 track count
+        diskInfo[unit].platters = 3;                            // TEST02 ADD disk1 platter count
+    }
+    else                                                        // TEST02 ADD guard invalid unit
+    {
+        diskInfo[unit].tracks = 0;                              // TEST02 ADD clear invalid tracks
+        diskInfo[unit].platters = 0;                            // TEST02 ADD clear invalid platters
+    }
 
     while (!signaled())
     {
-        wait_device("clock", &status);
-        //wait_device(diskInfo[unit].deviceName, &status);           // TEST00 ALTER block on disk device
+        wait_device("clock", &status);                          // TEST02 ALTER temporary safe disk block
     }
     return 0;
 }
-
 
 struct psr_bits {
     unsigned int cur_int_enable : 1;
@@ -335,7 +375,26 @@ static void system_call_handler(system_call_arguments_t* args)
         args->arguments[3] = result;                                // TEST00 ADD return sleep status
         break;
     }
+    case SYS_DISKINFO_CALL:
+    {
+        int unit;                                                  // TEST02 ADD target disk unit
+        int sectorSize;                                            // TEST02 ADD returned sector size
+        int sectorCount;                                           // TEST02 ADD returned sector count
+        int trackCount;                                            // TEST02 ADD returned track count
+        int platterCount;                                          // TEST02 ADD returned platter count
+        int result;                                                // TEST02 ADD disk info result
 
+        unit = get_disk_unit((char*)args->arguments[0]);           // TEST02 ADD map disk name to unit
+
+        result = sys_disk_info(unit, &platterCount, &sectorCount, &trackCount, &sectorSize); // TEST02 ADD fetch disk info
+
+        args->arguments[0] = sectorSize;                           // TEST02 ALTER return sector size
+        args->arguments[1] = sectorCount;                          // TEST02 ALTER return sector count
+        args->arguments[2] = trackCount;                           // TEST02 ALTER return track count
+        args->arguments[3] = result;                               // TEST02 ALTER return syscall status
+        args->arguments[4] = platterCount;                         // TEST02 ALTER return platter count
+        break;
+    }
     default:
     {
         console_output(FALSE, "nullsys3(): Invalid system_call %d\n", args->call_id); // TEST00 ADD report invalid syscall
@@ -352,4 +411,46 @@ static int get_current_time(void)
 {
     checkKernelMode(__func__);                                    // TEST00 ADD validate kernel mode
     return sleepClockTime;                                        // TEST00 ALTER return shared sleep clock
+}
+
+static int get_disk_unit(char* deviceName)
+{
+    if (deviceName == NULL)                                        // TEST02 ADD reject null device name
+    {
+        return -1;                                                 // TEST02 ADD invalid device name
+    }
+
+    if (strcmp(deviceName, "disk0") == 0)                          // TEST02 ADD map first disk
+    {
+        return 0;                                                  // TEST02 ADD return disk zero
+    }
+
+    if (strcmp(deviceName, "disk1") == 0)                          // TEST02 ADD map second disk
+    {
+        return 1;                                                  // TEST02 ADD return disk one
+    }
+
+    return -1;                                                     // TEST02 ADD unknown disk name
+}
+
+int sys_disk_info(int unit, int* platters, int* sectors, int* tracks, int* disk)
+{
+    checkKernelMode(__func__);                                     // TEST02 ADD validate kernel mode
+
+    if (unit < 0 || unit >= THREADS_MAX_DISKS)                     // TEST02 ADD reject invalid disk unit
+    {
+        return -1;                                                 // TEST02 ADD invalid unit
+    }
+
+    if (platters == NULL || sectors == NULL || tracks == NULL || disk == NULL) // TEST02 ADD validate output pointers
+    {
+        return -1;                                                 // TEST02 ADD invalid output pointers
+    }
+
+    *platters = diskInfo[unit].platters;                           // TEST02 ADD return platter count
+    *sectors = diskInfo[unit].sectors;                             // TEST02 ADD return sector count
+    *tracks = diskInfo[unit].tracks;                               // TEST02 ADD return track count
+    *disk = THREADS_DISK_SECTOR_SIZE;                              // TEST02 ADD return sector size
+
+    return 0;                                                      // TEST02 ADD disk info success
 }
