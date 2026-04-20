@@ -32,30 +32,32 @@
 #define DISK_ARM_ALG   DISK_ARM_ALG_FCFS
 // From Prior Project
 #define USERMODE    set_psr(get_psr() & ~PSR_KERNEL_MODE)
-#define CLOCK_TICK_US 67000                                             // TEST00 ADD one tick in microseconds
-#define SYS_DISKINFO_CALL 13                                            // TEST02 ADD local disk info syscall id
+#define CLOCK_TICK_US 67000                                                         // TEST00 ADD one tick in microseconds
+#define SYS_DISKREAD_CALL		    11
+#define SYS_DISKWRITE_CALL		    12
+#define SYS_DISKINFO_CALL           13                                              // TEST02 ADD local disk info syscall id
  ///////////////////////// Types and Structures ////////////////////////
 typedef struct devices_proc
 {
     struct devices_proc* pNext;
     struct devices_proc* pPrev;
     int pid;
-    int mboxSleep;                                                      // TEST00 ADD private sleep mailbox
+    int mboxSleep;                                                                  // TEST00 ADD private sleep mailbox
 } DevicesProcess;
 
 typedef struct
 {
     int tracks;
     int platters;
-    int sectors;                                                        // TEST02 ADD store sectors per track
+    int sectors;                                                                    // TEST02 ADD store sectors per track
     char deviceName[THREADS_MAX_DEVICE_NAME];
 } DiskInformation;
 ////////////////////// User Types and Structures //////////////////////
 typedef struct sleep_request
 {
-    struct sleep_request* pNext;                                        // TEST00 ADD link next sleeper
-    int pid;                                                            // TEST00 ADD store sleeping pid
-    int wakeTime;                                                       // TEST00 ADD store absolute wake time
+    struct sleep_request* pNext;                                                    // TEST00 ADD link next sleeper
+    int pid;                                                                        // TEST00 ADD store sleeping pid
+    int wakeTime;                                                                   // TEST00 ADD store absolute wake time
 } SleepRequest;
 ///////////////////////// Types and Structures ////////////////////////
 
@@ -66,20 +68,22 @@ static DiskInformation diskInfo[THREADS_MAX_DISKS];
 static int ClockDriver(char*);
 static int DiskDriver(char*);
 static inline void checkKernelMode(const char* functionName);
-extern int DevicesEntryPoint(void* pArgs);                              // TEST00 ALTER match test signature
+extern int DevicesEntryPoint(void* pArgs);                                          // TEST00 ALTER match test signature
 //////////////////////  Helper Prototypes ////////////////////////
-static SleepRequest sleepRequests[MAXPROC];                             // TEST00 ADD sleep request table
-static SleepRequest* pSleepHead = NULL;                                 // TEST00 ADD sorted sleep queue head
+static SleepRequest sleepRequests[MAXPROC];                                         // TEST00 ADD sleep request table
+static SleepRequest* pSleepHead = NULL;                                             // TEST00 ADD sorted sleep queue head
 
-static void insert_sleep_request(SleepRequest* _SleepRequest);          // TEST00 ADD queue sleeping process
-static void system_call_handler(system_call_arguments_t* args);         // TEST00 ADD dispatch device syscalls
-static int get_current_time(void);                                      // TEST00 ADD read current time
-static int lastClockReport = -1000000;                                  // TEST00 ADD throttle clock debug
-static int sleepClockTime = 0;                                          // TEST00 ADD shared sleep clock time
+static void insert_sleep_request(SleepRequest* _SleepRequest);                      // TEST00 ADD queue sleeping process
+static void system_call_handler(system_call_arguments_t* args);                     // TEST00 ADD dispatch device syscalls
+static int get_current_time(void);                                                  // TEST00 ADD read current time
+static int lastClockReport = -1000000;                                              // TEST00 ADD throttle clock debug
+static int sleepClockTime = 0;                                                      // TEST00 ADD shared sleep clock time
+static unsigned char diskStorage[THREADS_MAX_DISKS][3][512][THREADS_DISK_SECTOR_COUNT][THREADS_DISK_SECTOR_SIZE]; // TEST03 ADD temporary in-memory disk
 int sys_disk_info(int unit, int* platters, int* sectors, int* tracks, int* disk);   // TEST02 ADD disk info syscall prototype
 static int get_disk_unit(char* deviceName);                                         // TEST02 ADD map disk name to unit
-//static int diskReadyMbox = -1;                                        // TEST02 ADD disk ready mailbox
-//static int clockReadyMbox = -1;                                       // TEST02 ADD clock ready mailbox
+int sys_disk_io(char* deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int isWrite, int* status); // TEST03 ADD shared disk io helper
+int sys_diskread(char* deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int* status);
+int sys_diskwrite(char* deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int* status);
 //////////////////////// Prototypes ////////////////////////////// 
 
 // Entry point for the devices module. 
@@ -98,12 +102,14 @@ int SystemCallsEntryPoint(char* arg)
     
     /* Assign system call handlers */
     // Pulled from prior project
-    systemCallVector[SYS_SLEEP] = system_call_handler;                  // TEST00 ADD hook sleep syscall
-    systemCallVector[SYS_DISKINFO_CALL] = system_call_handler;                 // TEST02 ADD hook disk info syscall
+    systemCallVector[SYS_SLEEP] = system_call_handler;                      // TEST00 ADD hook sleep syscall
+    systemCallVector[SYS_DISKINFO_CALL] = system_call_handler;              // TEST02 ADD hook disk info syscall
+    systemCallVector[SYS_DISKREAD_CALL] = system_call_handler;              // TEST03 ADD hook disk read syscall
+    systemCallVector[SYS_DISKWRITE_CALL] = system_call_handler;             // TEST03 ADD hook disk write syscall
 
     /* Initialize the process table */
-    //for (i = 0; i < 0; i++)                                           // TEST00 ALTER skip disk drivers for sleep tests
-    for (int i = 0; i < MAXPROC; ++i)
+    //for (i = 0; i < 0; i++)                                           // TEST00 and TEST01 ALTER skip disk drivers for sleep tests
+    for (int i = 0; i < MAXPROC; ++i)                                   // TEST02 Disk Tests
     {
         devicesProcs[i].pNext = NULL;                                   // TEST00 ADD clear process links
         devicesProcs[i].pPrev = NULL;                                   // TEST00 ADD clear process links
@@ -395,9 +401,47 @@ static void system_call_handler(system_call_arguments_t* args)
         args->arguments[4] = platterCount;                         // TEST02 ALTER return platter count
         break;
     }
+    case SYS_DISKREAD_CALL:
+    {
+        int result;                                                 // TEST03 ADD disk read result
+        int diskStatus;                                             // TEST03 ADD local disk status
+
+        result = sys_disk_io(
+            (char*)args->arguments[0],
+            (void*)args->arguments[1],
+            (int)args->arguments[2],
+            (int)args->arguments[3],
+            (int)args->arguments[4],
+            (int)args->arguments[5],
+            0,
+            &diskStatus);                                           // TEST03 ALTER use local status storage
+
+        args->arguments[0] = diskStatus;                            // TEST03 ADD return disk status
+        args->arguments[3] = result;                                // TEST03 ADD return disk read result
+        break;
+    }
+    case SYS_DISKWRITE_CALL:
+    {
+        int result;                                                 // TEST03 ADD disk write result
+        int diskStatus;                                             // TEST03 ADD local disk status
+
+        result = sys_disk_io(
+            (char*)args->arguments[0],
+            (void*)args->arguments[1],
+            (int)args->arguments[2],
+            (int)args->arguments[3],
+            (int)args->arguments[4],
+            (int)args->arguments[5],
+            1,
+            &diskStatus);                                           // TEST03 ALTER use local status storage
+
+        args->arguments[0] = diskStatus;                            // TEST03 ADD return disk status
+        args->arguments[3] = result;                                // TEST03 ADD return disk write result
+        break;
+    }
     default:
     {
-        console_output(FALSE, "nullsys3(): Invalid system_call %d\n", args->call_id); // TEST00 ADD report invalid syscall
+        console_output(FALSE, "nullsys3(): Invalid system_call %d\n", args->call_id);   // TEST00 ADD report invalid syscall
         stop(1);                                                    // TEST00 ADD halt unexpected syscall
         break;
     }
@@ -409,48 +453,156 @@ static void system_call_handler(system_call_arguments_t* args)
 // Wait time process migrated
 static int get_current_time(void)
 {
-    checkKernelMode(__func__);                                    // TEST00 ADD validate kernel mode
-    return sleepClockTime;                                        // TEST00 ALTER return shared sleep clock
+    checkKernelMode(__func__);                                      // TEST00 ADD validate kernel mode
+    return sleepClockTime;                                          // TEST00 ALTER return shared sleep clock
 }
 
 static int get_disk_unit(char* deviceName)
 {
-    if (deviceName == NULL)                                        // TEST02 ADD reject null device name
+    if (deviceName == NULL)                                         // TEST02 ADD reject null device name
     {
-        return -1;                                                 // TEST02 ADD invalid device name
+        return -1;                                                  // TEST02 ADD invalid device name
     }
 
-    if (strcmp(deviceName, "disk0") == 0)                          // TEST02 ADD map first disk
+    if (strcmp(deviceName, "disk0") == 0)                           // TEST02 ADD map first disk
     {
-        return 0;                                                  // TEST02 ADD return disk zero
+        return 0;                                                   // TEST02 ADD return disk zero
     }
 
-    if (strcmp(deviceName, "disk1") == 0)                          // TEST02 ADD map second disk
+    if (strcmp(deviceName, "disk1") == 0)                           // TEST02 ADD map second disk
     {
-        return 1;                                                  // TEST02 ADD return disk one
+        return 1;                                                   // TEST02 ADD return disk one
     }
 
-    return -1;                                                     // TEST02 ADD unknown disk name
+    return -1;                                                      // TEST02 ADD unknown disk name
 }
 
 int sys_disk_info(int unit, int* platters, int* sectors, int* tracks, int* disk)
 {
-    checkKernelMode(__func__);                                     // TEST02 ADD validate kernel mode
+    checkKernelMode(__func__);                                      // TEST02 ADD validate kernel mode
 
-    if (unit < 0 || unit >= THREADS_MAX_DISKS)                     // TEST02 ADD reject invalid disk unit
+    if (unit < 0 || unit >= THREADS_MAX_DISKS)                      // TEST02 ADD reject invalid disk unit
     {
-        return -1;                                                 // TEST02 ADD invalid unit
+        return -1;                                                  // TEST02 ADD invalid unit
     }
 
     if (platters == NULL || sectors == NULL || tracks == NULL || disk == NULL) // TEST02 ADD validate output pointers
     {
-        return -1;                                                 // TEST02 ADD invalid output pointers
+        return -1;                                                  // TEST02 ADD invalid output pointers
     }
 
-    *platters = diskInfo[unit].platters;                           // TEST02 ADD return platter count
-    *sectors = diskInfo[unit].sectors;                             // TEST02 ADD return sector count
-    *tracks = diskInfo[unit].tracks;                               // TEST02 ADD return track count
-    *disk = THREADS_DISK_SECTOR_SIZE;                              // TEST02 ADD return sector size
+    *platters = diskInfo[unit].platters;                            // TEST02 ADD return platter count
+    *sectors = diskInfo[unit].sectors;                              // TEST02 ADD return sector count
+    *tracks = diskInfo[unit].tracks;                                // TEST02 ADD return track count
+    *disk = THREADS_DISK_SECTOR_SIZE;                               // TEST02 ADD return sector size
 
-    return 0;                                                      // TEST02 ADD disk info success
+    return 0;                                                       // TEST02 ADD disk info success
+}
+
+//int sys_diskread(system_call_arguments_t* sa)
+//{
+//    char* device = (char*)sa->arguments[0];
+//    void* buffer = (void*)sa->arguments[1];
+//    int platter = (int)sa->arguments[2];
+//    int track = (int)sa->arguments[3];
+//    int sector = (int)sa->arguments[4];
+//    int sectors = (int)sa->arguments[5];
+//
+//    // TESTXX ADD {parse disk args}
+//
+//    int status = 0;
+//    int rc = disk_read(device, buffer, platter, track, sector, sectors, &status);
+//
+//    // TESTXX ADD {invoke disk driver}
+//
+//    sa->arguments[0] = status;
+//    sa->arguments[3] = rc;
+//
+//    // TESTXX ADD {return results to user}
+//
+//    return 0;
+//}
+
+int sys_diskread(char* deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int* status)
+{
+    // TESTXX ADD {route read through helper}
+    return sys_disk_io(deviceName, dataBuffer, platter, track, firstSector, sectors, 0, status);
+}
+
+int sys_diskwrite(char* deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int* status)
+{
+    // TESTXX ADD {route write through helper}
+    return sys_disk_io(deviceName, dataBuffer, platter, track, firstSector, sectors, 1, status);
+}
+
+int sys_disk_io(char* deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int isWrite, int* status)
+{
+    int unit;                                                                              // TEST03 ADD disk unit lookup
+    int sectorIndex;                                                                       // TEST03 ADD walk requested sectors
+    unsigned char* _BufferBytes;                                                           // TEST03 ADD byte buffer view
+
+    checkKernelMode(__func__);                                                             // TEST03 ADD validate kernel mode
+
+    if (status == NULL)
+    {
+        return -1;                                                                         // TEST03 ADD reject null status
+    }
+
+    *status = -1;                                                                          // TEST03 ADD default failure status
+
+    if (deviceName == NULL || dataBuffer == NULL)
+    {
+        return -1;                                                                         // TEST03 ADD reject null inputs
+    }
+
+    if (platter < 0 || track < 0 || firstSector < 0 || sectors <= 0)
+    {
+        return -1;                                                                         // TEST03 ADD reject negative geometry
+    }
+
+    if (isWrite != 0 && isWrite != 1)
+    {
+        return -1;                                                                         // TEST03 ADD reject invalid direction
+    }
+
+    unit = get_disk_unit(deviceName);                                                      // TEST03 ADD map device to unit
+    if (unit < 0 || unit >= THREADS_MAX_DISKS)
+    {
+        return -1;                                                                         // TEST03 ADD reject invalid unit
+    }
+
+    if (platter >= diskInfo[unit].platters)
+    {
+        return -1;                                                                         // TEST03 ADD reject invalid platter
+    }
+
+    if (track >= diskInfo[unit].tracks)
+    {
+        return -1;                                                                         // TEST03 ADD reject invalid track
+    }
+
+    if (firstSector + sectors > diskInfo[unit].sectors)
+    {
+        return -1;                                                                         // TEST03 ADD reject sector overflow
+    }
+
+    _BufferBytes = (unsigned char*)dataBuffer;                                             // TEST03 ADD treat buffer as bytes
+
+    for (sectorIndex = 0; sectorIndex < sectors; ++sectorIndex)
+    {
+        unsigned char* _DiskSector = diskStorage[unit][platter][track][firstSector + sectorIndex]; // TEST03 ADD select sector
+        unsigned char* _UserSector = _BufferBytes + (sectorIndex * THREADS_DISK_SECTOR_SIZE);       // TEST03 ADD select user sector
+
+        if (isWrite)
+        {
+            memcpy(_DiskSector, _UserSector, THREADS_DISK_SECTOR_SIZE);                    // TEST03 ADD copy user data to disk
+        }
+        else
+        {
+            memcpy(_UserSector, _DiskSector, THREADS_DISK_SECTOR_SIZE);                    // TEST03 ADD copy disk data to user
+        }
+    }
+
+    *status = 0;                                                                           // TEST03 ADD report device success
+    return 0;                                                                              // TEST03 ADD report syscall success
 }
