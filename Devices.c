@@ -95,7 +95,6 @@ static int get_current_time(void);                                              
 static int lastClockReport = -1000000;                                              // TEST00 ADD throttle clock debug
 static int sleepClockTime = 0;                                                      // TEST00 ADD shared sleep clock time
 static int get_disk_unit(char* deviceName);
-//static unsigned char diskStorage[THREADS_MAX_DISKS][3][512][THREADS_DISK_SECTOR_COUNT][THREADS_DISK_SECTOR_SIZE]; // TEST03 ADD temporary in-memory disk
 static DiskRequest diskRequests[MAXPROC];                                             // TEST04 ADD request table
 static DiskRequest* pDiskQueueHead[THREADS_MAX_DISKS];                                // TEST04 ADD per-disk queue head
 static int diskRequestMbox[THREADS_MAX_DISKS];                                        // TEST04 ADD per-disk wake mailbox
@@ -103,6 +102,10 @@ static unsigned char diskStorage[THREADS_MAX_DISKS][3][512][THREADS_DISK_SECTOR_
 static void insert_disk_request(int unit, DiskRequest* _DiskRequest);                  // TEST04 ADD queue disk request
 static DiskRequest* pop_disk_request(int unit);                                        // TEST04 ADD pop disk request
 static int do_disk_transfer(DiskRequest* _DiskRequest);                                // TEST04 ADD execute disk request
+static int diskCurrentTrack[THREADS_MAX_DISKS];                                       // TEST08 ADD current arm track per disk
+static DiskRequest* remove_best_request(int unit);                                    // TEST08 ADD select next request by algorithm
+static DiskRequest* remove_fcfs_request(int unit);                                    // TEST08 ADD dequeue first request
+static DiskRequest* remove_sstf_request(int unit);                                    // TEST08 ADD dequeue closest request
 
 int sys_disk_info(int unit, int* platters, int* sectors, int* tracks, int* disk);   // TEST02 ADD disk info syscall prototype                            // TEST02 ADD map disk name to unit
 int sys_disk_io(char* deviceName, void* dataBuffer, int platter, int track, int firstSector, int sectors, int isWrite, int* status); // TEST03 ADD shared disk io helper
@@ -184,7 +187,7 @@ int SystemCallsEntryPoint(char* arg)
         }
         pDiskQueueHead[i] = NULL;                                                         // TEST04 ADD clear disk queue head
         diskRequestMbox[i] = mailbox_create(MAXPROC, 0);                                  // TEST04 ADD create disk wake mailbox
-
+        diskCurrentTrack[i] = 0;                                                          // TEST08 ADD initialize arm position
     }
 
     /* Create first user-level process and wait for it to finish */
@@ -301,14 +304,18 @@ static int DiskDriver(char* arg)
             break;                                                                         // TEST04 ADD stop after signal
         }
 
-        _DiskRequest = pop_disk_request(unit);                                             // TEST04 ADD dequeue next request
+        _DiskRequest = remove_best_request(unit);                                            // TEST04 ADD dequeue next request
         if (_DiskRequest == NULL)
         {
             continue;                                                                      // TEST04 ADD ignore empty wakeup
         }
 
         _DiskRequest->result = do_disk_transfer(_DiskRequest);                             // TEST04 ADD perform disk request
-        _DiskRequest->status = (_DiskRequest->result == 0) ? 0 : -1;                       // TEST04 ADD set device status
+        //_DiskRequest->status = (_DiskRequest->result == 0) ? 0 : -1;                       // TEST04 ADD set device status
+        if (_DiskRequest->result == 0)
+        {
+            diskCurrentTrack[unit] = _DiskRequest->track;                                     // TEST08 ADD update arm track after request
+        }
 
         mailbox_send(_DiskRequest->completeMbox, NULL, 0, FALSE);                          // TEST04 ADD wake requesting process
     }
@@ -757,4 +764,66 @@ static int do_disk_transfer(DiskRequest* _DiskRequest)
     }
 
     return 0;                                                                          // TEST04 ADD transfer success
+}
+
+static DiskRequest* remove_fcfs_request(int unit)
+{
+    return pop_disk_request(unit);                                                    // TEST08 ADD FCFS uses queue head
+}
+
+static DiskRequest* remove_sstf_request(int unit)
+{
+    DiskRequest* _Current;                                                            // TEST08 ADD walk queue
+    DiskRequest* _Previous;                                                           // TEST08 ADD track previous node
+    DiskRequest* _Best;                                                               // TEST08 ADD best request found
+    DiskRequest* _BestPrevious;                                                       // TEST08 ADD best previous node
+    int bestDistance;                                                                 // TEST08 ADD best seek distance
+
+    _Current = pDiskQueueHead[unit];
+    _Previous = NULL;
+    _Best = NULL;
+    _BestPrevious = NULL;
+    bestDistance = 0x7fffffff;
+
+    while (_Current != NULL)
+    {
+        int currentDistance = abs(_Current->track - diskCurrentTrack[unit]);          // TEST08 ADD compute seek distance
+
+        if (_Best == NULL || currentDistance < bestDistance)
+        {
+            _Best = _Current;                                                         // TEST08 ADD store closer request
+            _BestPrevious = _Previous;                                                // TEST08 ADD store prior node
+            bestDistance = currentDistance;                                           // TEST08 ADD save best distance
+        }
+
+        _Previous = _Current;                                                         // TEST08 ADD advance previous
+        _Current = _Current->pNext;                                                   // TEST08 ADD advance current
+    }
+
+    if (_Best == NULL)
+    {
+        return NULL;                                                                  // TEST08 ADD empty queue
+    }
+
+    if (_BestPrevious == NULL)
+    {
+        pDiskQueueHead[unit] = _Best->pNext;                                          // TEST08 ADD remove head request
+    }
+    else
+    {
+        _BestPrevious->pNext = _Best->pNext;                                          // TEST08 ADD unlink selected request
+    }
+
+    _Best->pNext = NULL;                                                              // TEST08 ADD clear next pointer
+    return _Best;                                                                     // TEST08 ADD return selected request
+}
+
+static DiskRequest* remove_best_request(int unit)
+{
+    if (DISK_ARM_ALG == DISK_ARM_ALG_FCFS)
+    {
+        return remove_fcfs_request(unit);                                             // TEST08 ADD choose FCFS policy
+    }
+
+    return remove_sstf_request(unit);                                                 // TEST08 ADD choose SSTF policy
 }
