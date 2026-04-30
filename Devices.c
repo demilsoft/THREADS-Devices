@@ -2,11 +2,13 @@
 // CYBV 489 - OS Theory 
 // Name: Dean Lewis
 //
-// Devices.c - Implements the clock and disk drivers, as well as the system call handler. 
-// he clock driver should wake up sleeping processes when their time has come, and the disk driver 
-// should process disk requests from user-level processes. You will need to implement the disk arm 
-// scheduling algorithms (FCFS, SSTF, etc.) in the disk driver. The system call handler will be 
-// implemented in SystemCalls.c, but you may need to add some code here to support it.
+// Devices.c - THREADs Part 4
+// 
+// This code file implements the clock and disk drivers, and the system call handler. 
+// The clock driver should wake up sleeping processes at the appropriate time, and the disk driver 
+// should handle  user level process disk requests. Implements the disk arm 
+// scheduling algorithms (FCFS or SSTF) in the disk driver. The system call handler will be 
+// implemented using SystemCalls.c.
 ////////////////////////////////////////////////////////////////////////////
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -24,22 +26,24 @@
 #include <Devices.h>
 
 /* Set the disk arm scheduling algorithm.
- * See Devices.h for available constants (DISK_ARM_ALG_FCFS, DISK_ARM_ALG_SSTF, etc.).
- * You must implement FCFS and SSTF. Change this value to test each algorithm.
- * Submissions will be assessed with DISK_ARM_ALG_FCFS and DISK_ARM_ALG_SSTF. */
+* See Devices.h for available constants (DISK_ARM_ALG_FCFS, DISK_ARM_ALG_SSTF, etc.).
+* You must implement FCFS and SSTF. Change this value to test each algorithm.
+* Submissions will be assessed with DISK_ARM_ALG_FCFS and DISK_ARM_ALG_SSTF. */
  
- ///////////////////////// Define Statements /////////////////////////
- // SSTF  &  FCFS
-//#define DISK_ARM_ALG   DISK_ARM_ALG_SSTF
+//////////////////// SCHEDULING ALGORITHM SELECTION  ////////////////////////
+/////////////////////////////// SSTF  or  FCFS //////////////////////////////
+// #define DISK_ARM_ALG   DISK_ARM_ALG_SSTF     
 #define DISK_ARM_ALG   DISK_ARM_ALG_FCFS
+//////////////////// SCHEDULING ALGORITHM SELECTION  ////////////////////////
 
+///////////////////////// Define Statements /////////////////////////
 // Migrated Prior Project
 #define USERMODE    set_psr(get_psr() & ~PSR_KERNEL_MODE)
 #define CLOCK_TICK_US 67000                                                         // TEST00 ADD microseconds
 #define SYS_DISKREAD_CALL		    11                                              // TEST13 ADD local disk read syscall id
 #define SYS_DISKWRITE_CALL		    12                                              // TEST13 ADD local disk write syscall id
 #define SYS_DISKINFO_CALL           13                                              // TEST02 ADD local disk info syscall id
- ///////////////////////// Types and Structures ////////////////////////
+///////////////////////// Types and Structures ////////////////////////
 typedef struct devices_proc
 {
     struct devices_proc* pNext;
@@ -81,6 +85,9 @@ typedef struct disk_request
 ///////////////////////// Types and Structures ////////////////////////
 
 //////////////////////// Prototypes & Globals /////////////////////////
+static int lastClockReport = -1000000;                                              // TEST00 ADD clock debug
+static int sleepClockTime = 0;                                                      // TEST00 ADD shared sleep clock
+
 static DevicesProcess devicesProcs[MAXPROC];
 static DiskInformation diskInfo[THREADS_MAX_DISKS];
 
@@ -89,24 +96,23 @@ static SleepRequest* pSleepHead = NULL;                                         
 static DiskRequest diskRequests[MAXPROC];                                           // TEST04 ADD req table
 static DiskRequest* pDiskQueueHead[THREADS_MAX_DISKS];                              // TEST04 ADD disk queue head
 static DiskRequest* pop_disk_request(int unit);                                     // TEST04 ADD pop disk 
-static DiskRequest* request_meth(int unit);                                  // TEST08 ADD select next 
-static DiskRequest* fcfs_request(int unit);                                  // TEST08 ADD dequeue fcfs
-static DiskRequest* sstf_request(int unit);                                  // TEST08 ADD dequeue sstf
+static DiskRequest* request_meth(int unit);                                         // TEST08 ADD select next 
+static DiskRequest* fcfs_request(int unit);                                         // TEST08 ADD dequeue fcfs
+static DiskRequest* sstf_request(int unit);                                         // TEST08 ADD dequeue sstf
 
-static int diskReadyMbox;                                                           // TEST13 ADD disk driver ready mailbox
+static int ClockDriver(char*);
+static int DiskDriver(char*);
 static int clockReadyMbox;
-static int lastClockReport = -1000000;                                              // TEST00 ADD clock debug
-static int sleepClockTime = 0;                                                      // TEST00 ADD shared sleep clock
 static int diskRequestMbox[THREADS_MAX_DISKS];                                      // TEST04 ADD disk wake mailbox
+static int diskReadyMbox;                                                           // TEST13 ADD disk driver ready mailbox
 static unsigned char diskStorage[THREADS_MAX_DISKS][3][512]
     [THREADS_DISK_SECTOR_COUNT][THREADS_DISK_SECTOR_SIZE];                          // TEST03 ADD temp in mem disk
 static int diskCurrentTrack[THREADS_MAX_DISKS];                                     // TEST08 ADD current arm track disk
 static int diskTrackKnown[THREADS_MAX_DISKS];                                       // TEST21 ADD flag per disk
-static int ClockDriver(char*);
-static int DiskDriver(char*);
 extern int DevicesEntryPoint(void* pArgs);                                          // TEST00 ALTER test signature
 static inline void checkKernelMode(const char* functionName);
 static void system_call_handler(system_call_arguments_t* args);                     // TEST00 ADD dispatch device syscalls
+
 static int get_current_time(void);                                                  // TEST00 ADD read time
 static int get_disk_unit(char* deviceName);
 static void insert_disk_request(int unit, DiskRequest* _DiskRequest);               // TEST04 ADD queue disk 
@@ -281,13 +287,13 @@ static int DiskDriver(char* arg)
             break;                                                              // TEST04 ADD stop after signal
         }
 
-        _DiskRequest = request_meth(unit);                               // TEST04 ADD dequeue next req
+        _DiskRequest = request_meth(unit);                                      // TEST04 ADD dequeue next req
         if (_DiskRequest == NULL)
         {
             continue;                                                           // TEST04 ADD ignore empty
         }
 
-        _DiskRequest->result = disk_transfer(_DiskRequest);                  // TEST04 ADD perform disk req
+        _DiskRequest->result = disk_transfer(_DiskRequest);                     // TEST04 ADD perform disk req
         _DiskRequest->status = (_DiskRequest->result == 0) ? 0 : -1;            // TEST13 ADD set req status
 
         if (_DiskRequest->result == 0)
@@ -851,9 +857,9 @@ static DiskRequest* request_meth(int unit)
 {
     if (DISK_ARM_ALG == DISK_ARM_ALG_FCFS)
     {
-        return fcfs_request(unit);                                       // TEST08 ADD choose FCFS 
+        return fcfs_request(unit);                                              // TEST08 ADD choose FCFS 
     }
 
-    return sstf_request(unit);                                           // TEST08 ADD choose SSTF 
+    return sstf_request(unit);                                                  // TEST08 ADD choose SSTF 
 }
 
